@@ -1,0 +1,22 @@
+[package]
+name = "rust-latency"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alloy-primitives = { version = "1", features = ["serde"] }
+alloy-sol-types = "1"
+dotenvy = "0.15"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+k256 = { version = "0.13", features = ["ecdsa-core"] }
+sha3 = "0.10"
+tokio = { version = "1", features = ["full"] }
+rand = "0.8"
+hex = "0.4"
+base64 = "0.22"
+
+[profile.release]
+opt-level = 3
+lto = true
