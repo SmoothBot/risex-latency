@@ -18,7 +18,8 @@ No tests exist yet. No CI configured.
 
 Loaded from `.env` and `../.env` (parent directory) via dotenvy:
 
-- `ACCOUNT_PRIVATE_KEY` (required) - Ethereum private key hex for the trading account
+- `ACCOUNT_ADDRESS` (required if no `ACCOUNT_PRIVATE_KEY`) - Ethereum address of the trading account
+- `ACCOUNT_PRIVATE_KEY` (optional) - Ethereum private key hex for the trading account; only needed if the signer is not yet registered
 - `SIGNER_PRIVATE_KEY` (required) - Ethereum private key hex for the session signer
 - `API_URL` (optional) - RISEx API base URL, defaults to `https://api.testnet.rise.trade`
 

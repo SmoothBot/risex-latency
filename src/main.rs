@@ -7,6 +7,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // ── Constants ──────────────────────────────────────────────
 const ROUNDS: usize = 10;
+const MAX_NONCE_RETRIES: usize = 3;
 const MARKET_SYMBOL: &str = "ETH/USDC";
 const PERMIT_DEADLINE_SECS: u64 = 604800;
 const SIGNER_EXPIRY_SECS: u64 = 30 * 24 * 3600;
@@ -244,7 +245,7 @@ fn encode_cancel_all_hash(market_id: u32) -> B256 {
 struct RiseClient {
     http: Client,
     base_url: String,
-    account_key: SigningKey,
+    account_key: Option<SigningKey>,
     signer_key: SigningKey,
     account: Address,
     signer_addr: Address,
@@ -253,11 +254,9 @@ struct RiseClient {
 }
 
 impl RiseClient {
-    async fn new(base_url: &str, account_hex: &str, signer_hex: &str) -> Self {
+    async fn new(base_url: &str, account: Address, account_key: Option<SigningKey>, signer_hex: &str) -> Self {
         let http = Client::new();
-        let account_key = signing_key_from_hex(account_hex);
         let signer_key = signing_key_from_hex(signer_hex);
-        let account = address_from_key(&account_key);
         let signer_addr = address_from_key(&signer_key);
 
         let mut client = Self {
@@ -302,7 +301,15 @@ impl RiseClient {
             .get(format!("{}/v1/auth/session-key-status?account={}&signer={}",
                 self.base_url, self.account, self.signer_addr))
             .send().await.unwrap().json().await.unwrap();
-        if resp.data.map(|d| d.status).unwrap_or(0) == 1 { return; }
+        if resp.data.map(|d| d.status).unwrap_or(0) == 1 {
+            println!("  signer already registered, skipping");
+            return;
+        }
+
+        let account_key = self.account_key.as_ref().unwrap_or_else(|| {
+            panic!("Signer is not registered and ACCOUNT_PRIVATE_KEY is not set. \
+                    Either register the signer first or provide ACCOUNT_PRIVATE_KEY.")
+        });
 
         let nonce_state = self.get_nonce_state().await;
         let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -316,7 +323,7 @@ impl RiseClient {
             nonceBitmap: 0,
         };
         let digest = eip712_hash(&self.domain_separator, &reg.eip712_hash_struct().0);
-        let account_sig = sign_hash_hex(&self.account_key, &digest);
+        let account_sig = sign_hash_hex(account_key, &digest);
 
         let verify = VerifySigner {
             account: self.account,
@@ -381,40 +388,47 @@ impl RiseClient {
             time_in_force, post_only, reduce_only, stp_mode,
         );
 
-        // 2. Fetch nonce
-        let t = Instant::now();
-        let nonce_state = self.get_nonce_state().await;
-        let nonce_ms = t.elapsed().as_secs_f64() * 1000.0;
+        for attempt in 0..MAX_NONCE_RETRIES {
+            // 2. Fetch nonce
+            let t = Instant::now();
+            let nonce_state = self.get_nonce_state().await;
+            let nonce_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        // 3. Sign permit
-        let (permit, sign_ms) = self.sign_permit(hash, &nonce_state);
+            // 3. Sign permit
+            let (permit, sign_ms) = self.sign_permit(hash, &nonce_state);
 
-        // 4. Submit order
-        let t = Instant::now();
-        let body = PlaceOrderReq {
-            market_id, side, order_type, price_ticks, size_steps,
-            time_in_force, post_only, reduce_only, stp_mode,
-            ttl_units: 0, client_order_id: "0".to_string(), builder_id: 0,
-            permit,
-        };
-        let resp = self.http.post(format!("{}/v1/orders/place", self.base_url))
-            .json(&body).send().await.unwrap();
-        let status = resp.status();
-        let text = resp.text().await.unwrap();
-        let submit_ms = t.elapsed().as_secs_f64() * 1000.0;
+            // 4. Submit order
+            let t = Instant::now();
+            let body = PlaceOrderReq {
+                market_id, side, order_type, price_ticks, size_steps,
+                time_in_force, post_only, reduce_only, stp_mode,
+                ttl_units: 0, client_order_id: "0".to_string(), builder_id: 0,
+                permit,
+            };
+            let resp = self.http.post(format!("{}/v1/orders/place", self.base_url))
+                .json(&body).send().await.unwrap();
+            let status = resp.status();
+            let text = resp.text().await.unwrap();
+            let submit_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        if !status.is_success() {
-            panic!("place_order failed ({}): {}", status, text);
+            if !status.is_success() {
+                if text.contains("InvalidNonceIndex") && attempt < MAX_NONCE_RETRIES - 1 {
+                    eprintln!("  [retry {}/{}] nonce collision, refetching...", attempt + 1, MAX_NONCE_RETRIES - 1);
+                    continue;
+                }
+                panic!("place_order failed ({}): {}", status, text);
+            }
+            let api: ApiResponse<OrderResponse> =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse: {} body: {}", e, text));
+            let order = api.data.unwrap_or_else(|| panic!("no order data: {}", text));
+
+            let timing = Timing {
+                nonce_ms, sign_ms, submit_ms,
+                total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+            };
+            return (order, timing);
         }
-        let api: ApiResponse<OrderResponse> =
-            serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse: {} body: {}", e, text));
-        let order = api.data.unwrap_or_else(|| panic!("no order data: {}", text));
-
-        let timing = Timing {
-            nonce_ms, sign_ms, submit_ms,
-            total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
-        };
-        (order, timing)
+        unreachable!()
     }
 
     async fn market_buy_timed(&self, market_id: u32, size_steps: u32) -> (OrderResponse, Timing) {
@@ -435,32 +449,39 @@ impl RiseClient {
 
         let hash = encode_cancel_all_hash(market_id);
 
-        let t = Instant::now();
-        let nonce_state = self.get_nonce_state().await;
-        let nonce_ms = t.elapsed().as_secs_f64() * 1000.0;
+        for attempt in 0..MAX_NONCE_RETRIES {
+            let t = Instant::now();
+            let nonce_state = self.get_nonce_state().await;
+            let nonce_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        let (permit, sign_ms) = self.sign_permit(hash, &nonce_state);
+            let (permit, sign_ms) = self.sign_permit(hash, &nonce_state);
 
-        let t = Instant::now();
-        let body = serde_json::json!({ "market_id": market_id, "permit": permit });
-        let resp = self.http.post(format!("{}/v1/orders/cancel-all", self.base_url))
-            .json(&body).send().await.unwrap();
-        let status = resp.status();
-        let text = resp.text().await.unwrap();
-        let submit_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let t = Instant::now();
+            let body = serde_json::json!({ "market_id": market_id, "permit": permit });
+            let resp = self.http.post(format!("{}/v1/orders/cancel-all", self.base_url))
+                .json(&body).send().await.unwrap();
+            let status = resp.status();
+            let text = resp.text().await.unwrap();
+            let submit_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        if !status.is_success() {
-            panic!("cancel_all failed ({}): {}", status, text);
+            if !status.is_success() {
+                if text.contains("InvalidNonceIndex") && attempt < MAX_NONCE_RETRIES - 1 {
+                    eprintln!("  [retry {}/{}] nonce collision, refetching...", attempt + 1, MAX_NONCE_RETRIES - 1);
+                    continue;
+                }
+                panic!("cancel_all failed ({}): {}", status, text);
+            }
+            let api: ApiResponse<CancelResponse> =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse: {} body: {}", e, text));
+            let cancel = api.data.unwrap_or_else(|| panic!("no cancel data: {}", text));
+
+            let timing = Timing {
+                nonce_ms, sign_ms, submit_ms,
+                total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+            };
+            return (cancel, timing);
         }
-        let api: ApiResponse<CancelResponse> =
-            serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse: {} body: {}", e, text));
-        let cancel = api.data.unwrap_or_else(|| panic!("no cancel data: {}", text));
-
-        let timing = Timing {
-            nonce_ms, sign_ms, submit_ms,
-            total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
-        };
-        (cancel, timing)
+        unreachable!()
     }
 
     async fn close_position_timed(&self, market_id: u32, step_size: f64) -> Option<(OrderResponse, Timing, f64)> {
@@ -575,15 +596,27 @@ async fn main() {
     dotenvy::from_path("../.env").ok();
     dotenvy::dotenv().ok();
 
-    let account_key = std::env::var("ACCOUNT_PRIVATE_KEY").expect("ACCOUNT_PRIVATE_KEY not set");
-    let signer_key = std::env::var("SIGNER_PRIVATE_KEY").expect("SIGNER_PRIVATE_KEY not set");
+    let account_key_hex = std::env::var("ACCOUNT_PRIVATE_KEY").ok();
+    let signer_key_hex = std::env::var("SIGNER_PRIVATE_KEY").expect("SIGNER_PRIVATE_KEY not set");
     let api_url = std::env::var("API_URL").unwrap_or_else(|_| "https://api.testnet.rise.trade".into());
+
+    // Derive account address from ACCOUNT_ADDRESS or ACCOUNT_PRIVATE_KEY
+    let account_key = account_key_hex.as_deref().map(signing_key_from_hex);
+    let account: Address = match std::env::var("ACCOUNT_ADDRESS") {
+        Ok(addr) => addr.parse().expect("invalid ACCOUNT_ADDRESS"),
+        Err(_) => {
+            let key = account_key.as_ref().unwrap_or_else(|| {
+                panic!("Either ACCOUNT_ADDRESS or ACCOUNT_PRIVATE_KEY must be set")
+            });
+            address_from_key(key)
+        }
+    };
 
     let nonce_settle = std::time::Duration::from_secs(3);
 
     println!("Initializing client...");
     let t0 = Instant::now();
-    let client = RiseClient::new(&api_url, &account_key, &signer_key).await;
+    let client = RiseClient::new(&api_url, account, account_key, &signer_key_hex).await;
     println!("  init: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
     let t1 = Instant::now();
